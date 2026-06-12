@@ -1,0 +1,167 @@
+name: Build OpenWrt packages
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pre:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.gh.outputs.version }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: GH
+      id: gh
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        REPO=$(gh api repos/$GITHUB_REPOSITORY | jq -r '.parent.full_name')
+        echo "version=$(gh api repos/$REPO/releases/latest | jq -r '.tag_name' | sed 's/^v//')" >> $GITHUB_OUTPUT
+
+  build:
+    name: '${{ matrix.branch }} :: ${{ matrix.arch }}'
+    needs: pre
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        branch:
+          - openwrt-23.05
+          - openwrt-24.10
+        arch:
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_cortex-a76
+          - aarch64_generic
+          - arm_arm1176jzf-s_vfp
+          - arm_arm926ej-s
+          - arm_cortex-a15_neon-vfpv4
+          - arm_cortex-a5_vfpv4
+          - arm_cortex-a7
+          - arm_cortex-a7_neon-vfpv4
+          - arm_cortex-a7_vfpv4
+          - arm_cortex-a8_vfpv3
+          - arm_cortex-a9
+          - arm_cortex-a9_neon
+          - arm_cortex-a9_vfpv3-d16
+          - i386_pentium4
+          - mips64_mips64r2
+          - mips64_octeonplus
+          - mips64el_mips64r2
+          - mips_24kc
+          - mips_4kec
+          - mips_mips32
+          - mipsel_24kc
+          - mipsel_24kc_24kf
+          - mipsel_74kc
+          - mipsel_mips32
+          - x86_64
+        exclude:
+          - branch: openwrt-23.05
+            arch: aarch64_cortex-a76
+          - branch: openwrt-23.05
+            arch: mips64_mips64r2
+          - branch: openwrt-23.05
+            arch: mips64el_mips64r2
+      fail-fast: false
+    defaults: { run: { shell: bash } }
+    container:
+      image: openwrt/sdk:${{ matrix.arch }}-${{ matrix.branch }}
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up SDK
+        working-directory: /builder
+        run: |
+          if [[ ${{ matrix.branch }} == 'openwrt-23.05' ]]; then
+            export VERSION_PATH="releases/23.05.6"
+          fi
+          ./setup.sh || UPSTREAM_URL=https://mirror-03.infra.openwrt.org ./setup.sh
+
+      - name: Build packages
+        id: build
+        working-directory: /builder
+        env:
+          ARCH: ${{ matrix.arch }}
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          VERSION=${{ needs.pre.outputs.version }}
+          sed -e "s|@VERSION@|$VERSION|" \
+              -e "s|@REPO@|$GITHUB_REPOSITORY|" \
+              -e "s|@REV@|$GITHUB_REF_NAME|" -i $GITHUB_WORKSPACE/.github/package/sing-box/Makefile
+
+          mv feeds.conf.default feeds.conf
+          sed -e 's|base.*\.git|base https://github.com/openwrt/openwrt.git|' \
+              -e 's|packages.*\.git|packages https://github.com/openwrt/packages.git|' \
+              -e 's|luci.*\.git|luci https://github.com/openwrt/luci.git|' \
+              -e 's|routing.*\.git|routing https://github.com/openwrt/routing.git|' \
+              -e 's|telephony.*\.git|telephony https://github.com/openwrt/telephony.git|' -i feeds.conf
+          sed -i "1isrc-link repo $GITHUB_WORKSPACE/.github/package" feeds.conf
+
+          ./scripts/feeds update base packages luci repo
+          ./scripts/feeds install -a -p repo
+          make defconfig
+          make package/sing-box/compile -j$(nproc) BUILD_LOG=1
+
+          mkdir -p $GITHUB_WORKSPACE/pkg
+          mv ./bin/packages/*/repo/sing-box*.ipk $GITHUB_WORKSPACE/pkg
+          tar -C $GITHUB_WORKSPACE/pkg -cvf $GITHUB_WORKSPACE/pkg-$BRANCH-$ARCH.tar --transform "s|^\./|${BRANCH/openwrt-}/$ARCH/|" .
+
+      - name: Compress build logs
+        if: always()
+        run: tar -cJvf logs-${{ matrix.branch }}-${{ matrix.arch }}.tar.xz /builder/logs
+
+      - name: Upload packages
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.branch }}-${{ matrix.arch }}
+          path: pkg-*.tar
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.branch }}-${{ matrix.arch }}
+          path: logs-*.tar.xz
+
+  release:
+    name: Upload release ${{ matrix.branch }}
+    needs: [ pre, build ]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        branch:
+          - '23.05'
+          - '24.10'
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-openwrt-${{ matrix.branch }}-*
+
+      - name: Put ipk into zip
+        env:
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          find . -name "pkg-openwrt-$BRANCH-*.tar" -exec tar -xvf {} --wildcards '*.ipk' \;
+          mkdir -p public
+          find $BRANCH -mindepth 1 -type d -exec sh -c 'zip -0 ./public/sing-box-extended_$(basename {}).zip -j {} {}/*' \;
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          prerelease: false
+          draft: false
+          tag_name: ${{ matrix.branch }}-${{ needs.pre.outputs.version }}
+          name: '${{ needs.pre.outputs.version }} for OpenWrt ${{ matrix.branch }}'
+          body: |
+            ### sing-box-extended ${{ needs.pre.outputs.version }}
+          target_commitish: extended
+          files: ./public/*.zip
